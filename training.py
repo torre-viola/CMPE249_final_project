@@ -17,7 +17,7 @@ from av2.datasets.sensor.av2_sensor_dataloader import AV2SensorDataLoader
 DATASET_PATH = "D:\dummy_data"
 IN_CHANNELS = 27
 TIME_LIMIT = 80
-BATCH_SIZE = 1
+BATCH_SIZE = 8
 NUM_EPOCHS = 10
 
 LABELS_NUMS2WORDS_MAP = {
@@ -140,10 +140,10 @@ proj_model = timm.create_model(
 "mobilenetv3_large_100",
     pretrained=True,
     in_chans=IN_CHANNELS,
-    num_classes=11,
+    num_classes=10,
 )
 print(proj_model.default_cfg)
-# proj_model.cuda()
+#proj_model.cuda()
 
 optimizer = torch.optim.AdamW(proj_model.parameters(), lr=0.01)
 # print(proj_model)
@@ -151,17 +151,18 @@ optimizer = torch.optim.AdamW(proj_model.parameters(), lr=0.01)
 ### TRAIN ###
 for epoch in range(NUM_EPOCHS):
     print(f"Epoch number: {epoch}")
+    counter = 0 
     for x, true_label in argo_loader:
-        print(x.shape)
-        optimizer.zero_grad()
         pred_label = proj_model(x)
-        #print(f"pred_label: {pred_label}")
-        #print(f"true_label: {true_label}")
         loss = loss_func(pred_label, true_label)
 
         #loss.backward()
         optimizer.step()
         optimizer.zero_grad()
+        counter += 1
+        if counter % 5 == 0:
+            print(counter)
+        torch.cuda.empty_cache()
 
 ### EVALUATE ###
 proj_model.eval()
