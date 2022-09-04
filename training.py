@@ -14,10 +14,10 @@ from torch.utils.tensorboard import SummaryWriter
 from av2.utils.io import read_feather, read_img
 from av2.datasets.sensor.av2_sensor_dataloader import AV2SensorDataLoader
 
-DATASET_PATH = "/data/cmpe249-fa22/Argoverse_Sensor_Data/train"
+DATASET_PATH = "D:\dummy_data"
 IN_CHANNELS = 27
 TIME_LIMIT = 80
-BATCH_SIZE = 16
+BATCH_SIZE = 1
 NUM_EPOCHS = 10
 
 LABELS_NUMS2WORDS_MAP = {
@@ -64,7 +64,7 @@ class ArgoverseDataset(Dataset):
             labels_dir=Path(f"{DATASET_PATH}"),
         )
 
-        self.transform = transforms.Compose([transforms.ToTensor(), transforms.Resize(299)])
+        self.transform = transforms.Compose([transforms.ToTensor(), transforms.Resize((224, 224))])
 
     def __len__(self) -> int:
         return len(self.img_labels)
@@ -89,17 +89,19 @@ class ArgoverseDataset(Dataset):
                 # if the image is the opposite orientation than the majority, rotate it to be correct so we can stack them.
                 if image.shape == (2048, 1550, 3):
                     image = np.rot90(image).copy()
-                # print(view_path, "has shape", image.shape)
-                tensor_image = torch.as_tensor(image)
-                resized_img = transforms.Resize(299)(tensor_image)
-                agg_view.append(resized_img.to_numpy)
+                # image = np.transpose(image, (0, 1, 2))
+                resized_img = self.transform(image)
+                agg_view.append(resized_img)
         
         ret_label = self.img_labels.loc[self.img_labels['timestamp_ns'] == timestamp].copy()
         ret_label['category'] = ret_label.category.map(LABELS_WORDS2NUM_MAP).fillna(0).astype(int)
         ret_label.drop("track_uuid", axis=1, inplace=True)
+        ret_label.drop("timestamp_ns", axis=1, inplace=True)
+        ret_label.drop("num_interior_pts", axis=1, inplace=True)
 
-        x = np.swapaxes(np.dstack(agg_view),0,2)
 
+        #x = np.swapaxes(np.dstack(agg_view),0,2)
+        x = np.vstack(agg_view)
         return torch.as_tensor(x), torch.as_tensor(ret_label.to_numpy()[:10])
     
 def get_dataLoader(data: ArgoverseDataset) -> DataLoader :
@@ -120,7 +122,7 @@ def loss_func(pred_label, true_label):
 
 # Create model 
 proj_model = timm.create_model(
-    "xception71",
+    "mobilenetv3_large_100",
     pretrained=True,
     in_chans=IN_CHANNELS,
     num_classes=11,
@@ -135,10 +137,26 @@ for epoch in range(NUM_EPOCHS):
     print(f"Epoch number: {epoch}")
     for x, true_label in argo_loader:
         print(x.shape)
-        break;
+        optimizer.zero_grad()
         pred_label = proj_model(x)
+        #print(f"pred_label: {pred_label}")
+        #print(f"true_label: {true_label}")
         loss = loss_func(pred_label, true_label)
 
-        loss.backward()
+        loss.mean.backward()
         optimizer.step()
         optimizer.zero_grad()
+
+# put model into eval mode
+proj_model.eval()
+
+test_argo_data = ArgoverseDataset(
+    f"{DATASET_PATH}/01bb304d-7bd8-35f8-bbef-7086b688e35e/sensors/", 
+    f"{DATASET_PATH}/022af476-9937-3e70-be52-f65420d52703/annotations.feather",
+)
+test_argo_loader = get_dataLoader(test_argo_data)
+
+for x, true_label in test_argo_loader:
+    print(x.shape)
+    break;
+    confidences_logits, logits = proj_model(x)
