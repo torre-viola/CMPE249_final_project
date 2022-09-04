@@ -1,15 +1,18 @@
 import os
 from pathlib import Path
+
 import pandas as pd
-import torchvision
-from torchvision import transforms
-from torchvision.io import read_image
 import numpy as np 
 import timm
+
 import torch
 import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
+import torchvision
+from torchvision import transforms
+from torchvision.io import read_image
+from torchmetrics import JaccardIndex
 
 import av
 from av2.utils.io import read_feather, read_img
@@ -49,6 +52,23 @@ LABELS_WORDS2NUM_MAP = {
     "BUS": 10,
 }
 
+def data_processing(img_list):
+    """ This function prepares the x values to be used in model training, inference, or 
+        simply to run through the model (for example to produce visualizations)"""
+    agg_view = []
+    transform = transforms.Compose([transforms.ToTensor(), transforms.Resize((224, 224))])
+    for view_path in img_list:
+        if os.path.exists(view_path):
+            image = read_img(view_path)
+            # if the image is the opposite orientation than the majority, rotate it to be correct so we can stack them.
+            if image.shape == (2048, 1550, 3):
+                image = np.rot90(image).copy()
+            resized_img = transform(image)
+            agg_view.append(resized_img)
+        
+    x = np.vstack(agg_view)
+    return torch.as_tensor(x)
+
 class ArgoverseDataset(Dataset):
     """ class object which inherits from the pytorch Dataset class to 
         injest the dataset and prepare it for iteration during training """
@@ -60,12 +80,7 @@ class ArgoverseDataset(Dataset):
         # read_feather returns a pandas dataframe
         self.img_labels = read_feather(annotations_file)
         self.img_dir = img_dir
-
-        self.argo_data = AV2SensorDataLoader(
-            data_dir=Path(f"{DATASET_PATH}"), 
-            labels_dir=Path(f"{DATASET_PATH}"),
-        )
-
+        self.argo_data = AV2SensorDataLoader(data_dir=Path(f"{DATASET_PATH}"), labels_dir=Path(f"{DATASET_PATH}"))
         self.transform = transforms.Compose([transforms.ToTensor(), transforms.Resize((224, 224))])
 
     def __len__(self) -> int:
@@ -85,32 +100,17 @@ class ArgoverseDataset(Dataset):
         sfr_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "stereo_front_right", timestamp)
 
         ## Data Preprocessing
-        agg_view = []
-        for view_path in [rfc_path, rfl_path, rfr_path, rrl_path, rrr_path, rsl_path, rsr_path, sfl_path, sfr_path]:
-            if os.path.exists(view_path):
-                image = read_img(view_path)
-                # if the image is the opposite orientation than the majority, rotate it to be correct so we can stack them.
-                if image.shape == (2048, 1550, 3):
-                    image = np.rot90(image).copy()
-                # image = np.transpose(image, (0, 1, 2))
-                resized_img = self.transform(image)
-                agg_view.append(resized_img)
-        
+        img_list = [rfc_path, rfl_path, rfr_path, rrl_path, rrr_path, rsl_path, rsr_path, sfl_path, sfr_path]
+        x = data_processing(img_list)
+
         ret_label = self.img_labels.loc[self.img_labels['timestamp_ns'] == timestamp].copy()
         # replace word labels with numbers and remove rows of categories we aren't classifying
         ret_label['category'] = ret_label.category.map(LABELS_WORDS2NUM_MAP).fillna(0).astype(int)
         ret_label = ret_label.drop(ret_label[ret_label.category == 0].index)
-
         # drop unnecessary rows
-        ret_label.drop("track_uuid", axis=1, inplace=True)
-        ret_label.drop("timestamp_ns", axis=1, inplace=True)
-        ret_label.drop("num_interior_pts", axis=1, inplace=True)
+        ret_label.drop(["track_uuid", "timestamp_ns", "num_interior_pts"], axis=1, inplace=True)
 
-
-        #x = np.swapaxes(np.dstack(agg_view),0,2)
-        x = np.vstack(agg_view)
-        #return torch.as_tensor(x), torch.as_tensor(ret_label.to_numpy()[:10])
-        return torch.as_tensor(x), torch.as_tensor(ret_label['category'].to_numpy()[:10])
+        return x, torch.as_tensor(ret_label.to_numpy()[:10])
     
 def get_dataLoader(data: ArgoverseDataset) -> DataLoader :
     return DataLoader(
@@ -120,19 +120,22 @@ def get_dataLoader(data: ArgoverseDataset) -> DataLoader :
         pin_memory=False,
     )
 
-def loss_func(pred_label, true_label):
+def proj_loss_func(pred_label, true_label):
     """This is the loss function for the model. The labels 
        contain a model class as well as bounding box locations."""
     #print(f"pred_label: {pred_label}")
     #print(f"true_label: {true_label}")
-    finds = 0
+    finds = []
     
-    pred_label = np.argmax(pred_label.detach().numpy(), axis=1)
+    pred_label = torch.argmax(pred_label, axis=1)
     for label in true_label:
-        if label in pred_label:
-            finds += 1
+        for pred in pred_label:
+            if label in pred:
+                finds.append(1)
+            else: 
+                finds.append(0)
 
-    return 1 - finds/len(true_label)
+    return torch.sum(torch.as_tensor(finds)/len(true_label))
 
 ### BEGIN THE SCRIPT ###
 # instantiate the training data and the data loader
@@ -141,7 +144,7 @@ argo_loader = get_dataLoader(argo_data)
 
 # create model 
 proj_model = timm.create_model(
-"mobilenetv3_large_100",
+    "mobilenetv3_large_100",
     pretrained=True,
     in_chans=IN_CHANNELS,
     num_classes=10,
@@ -152,23 +155,28 @@ print(proj_model.default_cfg)
 optimizer = torch.optim.AdamW(proj_model.parameters(), lr=0.01)
 # print(proj_model)
 
-"""
+
 ### TRAIN ###
 for epoch in range(NUM_EPOCHS):
     print(f"Epoch number: {epoch}")
     counter = 0 
     for x, true_label in argo_loader:
-        pred_label = proj_model(x)
-        loss = loss_func(pred_label, true_label)
-
-        #loss.backward()
-        optimizer.step()
         optimizer.zero_grad()
+        pred_label = proj_model(x)
+        # print(f"losses: {pred_label}")
+        # loss_func = JaccardIndex(10, multilabel=True)
+        loss = proj_loss_func(pred_label, true_label).requires_grad_()
+
+        loss.backward()
+        optimizer.step()
         counter += 1
+        torch.cuda.empty_cache()
+
+        if counter == 50:
+            break;
         if counter % 5 == 0:
             print(counter)
-        torch.cuda.empty_cache()
-"""
+
 
 ### EVALUATE ###
 proj_model.eval()
@@ -182,7 +190,6 @@ test_argo_loader = get_dataLoader(test_argo_data)
 
 counter = 0
 for x, true_label in test_argo_loader:
-    print(x.shape)
     confidences_logits = proj_model(x)
     counter += 1
     if counter > 10:
@@ -190,7 +197,11 @@ for x, true_label in test_argo_loader:
 
 
 ### VISUALIZATION ###
+# Right now, the visualization just visualizes the image data. It does not add any info gleaned from 
+# running the images through the model. 
+
 # video parameter definition
+fps = 24
 video = av.open("C:/Users/viola/Documents/MSAI/CMPE249/final_proj_vid.mp4", mode="w")
 stream = video.add_stream("mpeg4", rate=fps)
 stream.width = 1550
@@ -198,23 +209,50 @@ stream.height = 2048
 stream.pix_fmt = "yuv420p"
 
 # initialize images that will be used in video
-vis_data = AV2SensorDataLoader(
-    data_dir=Path(f"{DATASET_PATH}"), 
-    labels_dir=Path(f"{DATASET_PATH}"),
-)
+vis_data = AV2SensorDataLoader(data_dir=Path(f"{DATASET_PATH}"), labels_dir=Path(f"{DATASET_PATH}"))
 vis_folder = "01bb304d-7bd8-35f8-bbef-7086b688e35e"
 
 # iterate through one of the image directories to get all the timestamps.  
 for filename in os.listdir("D:/dummy_data/01bb304d-7bd8-35f8-bbef-7086b688e35e/sensors/cameras/ring_front_center"):
     timestamp = int(os.path.splitext(filename)[0])
+
+    # get file paths for each camera in tiling function
+    ring_front_center_fpath = vis_data.get_closest_img_fpath(vis_folder, "ring_front_center", timestamp)
+    ring_front_left_fpath = vis_data.get_closest_img_fpath(vis_folder, "ring_front_left", timestamp)
+    ring_front_right_fpath = vis_data.get_closest_img_fpath(vis_folder, "ring_front_right", timestamp)
+    ring_rear_left_fpath = vis_data.get_closest_img_fpath(vis_folder, "ring_rear_left", timestamp)
+    ring_rear_right_fpath = vis_data.get_closest_img_fpath(vis_folder, "ring_rear_right", timestamp)
+    ring_side_left_fpath = vis_data.get_closest_img_fpath(vis_folder, "ring_side_left", timestamp)
+    ring_side_right_fpath = vis_data.get_closest_img_fpath(vis_folder, "ring_side_right", timestamp)
+    stereo_front_left_fpath = vis_data.get_closest_img_fpath(vis_folder, "stereo_front_left", timestamp)
+    stereo_front_right_fpath = vis_data.get_closest_img_fpath(vis_folder, "stereo_front_right", timestamp)
+    # make image dict for tile_cameras function
     named_sensor_data = {}
-    named_sensor_data["ring_front_center"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_front_center", timestamp))
-    named_sensor_data["ring_front_left"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_front_left", timestamp))
-    named_sensor_data["ring_front_right"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_front_right", timestamp))
-    named_sensor_data["ring_rear_left"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_rear_left", timestamp))
-    named_sensor_data["ring_rear_right"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_rear_right", timestamp))
-    named_sensor_data["ring_side_left"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_side_left", timestamp))
-    named_sensor_data["ring_side_right"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_side_right", timestamp))
+    named_sensor_data["ring_front_center"] = read_img(ring_front_center_fpath)
+    named_sensor_data["ring_front_left"] = read_img(ring_front_left_fpath)
+    named_sensor_data["ring_front_right"] = read_img(ring_front_right_fpath)
+    named_sensor_data["ring_rear_left"] = read_img(ring_rear_left_fpath)
+    named_sensor_data["ring_rear_right"] = read_img(ring_rear_right_fpath)
+    named_sensor_data["ring_side_left"] = read_img(ring_side_left_fpath)
+    named_sensor_data["ring_side_right"] = read_img(ring_side_right_fpath)
+
+    # put together image list for data processing and run model inference 
+    # even though the stereo images are not included in the visualization, 
+    # they still need to be including in inference
+    img_list = [
+        ring_front_center_fpath,
+        ring_front_left_fpath,
+        ring_front_right_fpath,
+        ring_rear_left_fpath,
+        ring_rear_right_fpath,
+        ring_side_left_fpath,
+        ring_side_right_fpath,
+        stereo_front_left_fpath,
+        stereo_front_right_fpath,
+    ]
+    x = data_processing(img_list)
+    boxes = proj_model(np.expand_dims(x, axis=0))
+    print(f"boxes: {boxes}")
 
     # add images from all cameras to one frame
     frame = av.VideoFrame.from_ndarray(np.array(tile_cameras(named_sensor_data)), format="rgb24")
