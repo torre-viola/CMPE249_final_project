@@ -11,14 +11,17 @@ import torch.nn as nn
 from torch.utils.data import DataLoader, Dataset
 from torch.utils.tensorboard import SummaryWriter
 
+import av
 from av2.utils.io import read_feather, read_img
 from av2.datasets.sensor.av2_sensor_dataloader import AV2SensorDataLoader
+from av2.rendering import video
+from av2.rendering.video import tile_cameras, write_video
 
 DATASET_PATH = "D:\dummy_data"
 IN_CHANNELS = 27
 TIME_LIMIT = 80
-BATCH_SIZE = 8
-NUM_EPOCHS = 10
+BATCH_SIZE = 4
+NUM_EPOCHS = 2
 
 LABELS_NUMS2WORDS_MAP = {
     1: "REGULAR_VEHICLE",
@@ -69,7 +72,7 @@ class ArgoverseDataset(Dataset):
         return len(self.img_labels)
 
     def __getitem__(self, idx: int) -> tuple:
-
+        ## Data Ingestion 
         timestamp = self.img_labels.iloc[idx, 0]
         rfc_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "ring_front_center", timestamp)
         rfl_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "ring_front_left", timestamp)
@@ -81,6 +84,7 @@ class ArgoverseDataset(Dataset):
         sfl_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "stereo_front_left", timestamp)
         sfr_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "stereo_front_right", timestamp)
 
+        ## Data Preprocessing
         agg_view = []
         for view_path in [rfc_path, rfl_path, rfr_path, rrl_path, rrr_path, rsl_path, rsr_path, sfl_path, sfr_path]:
             if os.path.exists(view_path):
@@ -135,7 +139,7 @@ def loss_func(pred_label, true_label):
 argo_data = ArgoverseDataset()
 argo_loader = get_dataLoader(argo_data)
 
-# Create model 
+# create model 
 proj_model = timm.create_model(
 "mobilenetv3_large_100",
     pretrained=True,
@@ -148,6 +152,7 @@ print(proj_model.default_cfg)
 optimizer = torch.optim.AdamW(proj_model.parameters(), lr=0.01)
 # print(proj_model)
 
+"""
 ### TRAIN ###
 for epoch in range(NUM_EPOCHS):
     print(f"Epoch number: {epoch}")
@@ -163,17 +168,63 @@ for epoch in range(NUM_EPOCHS):
         if counter % 5 == 0:
             print(counter)
         torch.cuda.empty_cache()
+"""
 
 ### EVALUATE ###
 proj_model.eval()
 
 # instantiate the testing data and the data loader
-test_argo_data = ArgoverseDataset(
-    f"{DATASET_PATH}/01bb304d-7bd8-35f8-bbef-7086b688e35e/sensors/", 
-    f"{DATASET_PATH}/022af476-9937-3e70-be52-f65420d52703/annotations.feather",
-)
+test_argo_data = ArgoverseDataset()
+#    f"{DATASET_PATH}/022af476-9937-3e70-be52-f65420d52703/sensors/", 
+#    f"{DATASET_PATH}/022af476-9937-3e70-be52-f65420d52703/annotations.feather",
+#)
 test_argo_loader = get_dataLoader(test_argo_data)
 
+counter = 0
 for x, true_label in test_argo_loader:
     print(x.shape)
-    confidences_logits, logits = proj_model(x)
+    confidences_logits = proj_model(x)
+    counter += 1
+    if counter > 10:
+        break;
+
+
+### VISUALIZATION ###
+# video parameter definition
+video = av.open("C:/Users/viola/Documents/MSAI/CMPE249/final_proj_vid.mp4", mode="w")
+stream = video.add_stream("mpeg4", rate=fps)
+stream.width = 1550
+stream.height = 2048
+stream.pix_fmt = "yuv420p"
+
+# initialize images that will be used in video
+vis_data = AV2SensorDataLoader(
+    data_dir=Path(f"{DATASET_PATH}"), 
+    labels_dir=Path(f"{DATASET_PATH}"),
+)
+vis_folder = "01bb304d-7bd8-35f8-bbef-7086b688e35e"
+
+# iterate through one of the image directories to get all the timestamps.  
+for filename in os.listdir("D:/dummy_data/01bb304d-7bd8-35f8-bbef-7086b688e35e/sensors/cameras/ring_front_center"):
+    timestamp = int(os.path.splitext(filename)[0])
+    named_sensor_data = {}
+    named_sensor_data["ring_front_center"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_front_center", timestamp))
+    named_sensor_data["ring_front_left"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_front_left", timestamp))
+    named_sensor_data["ring_front_right"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_front_right", timestamp))
+    named_sensor_data["ring_rear_left"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_rear_left", timestamp))
+    named_sensor_data["ring_rear_right"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_rear_right", timestamp))
+    named_sensor_data["ring_side_left"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_side_left", timestamp))
+    named_sensor_data["ring_side_right"] = read_img(vis_data.get_closest_img_fpath(vis_folder, "ring_side_right", timestamp))
+
+    # add images from all cameras to one frame
+    frame = av.VideoFrame.from_ndarray(np.array(tile_cameras(named_sensor_data)), format="rgb24")
+
+    # add frame to video
+    for packet in stream.encode(frame):
+        video.mux(packet)
+
+# flush stream
+for packet in stream.encode():
+    video.mux(packet)
+
+video.close()
