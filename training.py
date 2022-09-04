@@ -21,7 +21,6 @@ BATCH_SIZE = 1
 NUM_EPOCHS = 10
 
 LABELS_NUMS2WORDS_MAP = {
-    0: "OTHER",
     1: "REGULAR_VEHICLE",
     2: "PEDESTRIAN",
     3: "BOLLARD",
@@ -94,7 +93,11 @@ class ArgoverseDataset(Dataset):
                 agg_view.append(resized_img)
         
         ret_label = self.img_labels.loc[self.img_labels['timestamp_ns'] == timestamp].copy()
+        # replace word labels with numbers and remove rows of categories we aren't classifying
         ret_label['category'] = ret_label.category.map(LABELS_WORDS2NUM_MAP).fillna(0).astype(int)
+        ret_label = ret_label.drop(ret_label[ret_label.category == 0].index)
+
+        # drop unnecessary rows
         ret_label.drop("track_uuid", axis=1, inplace=True)
         ret_label.drop("timestamp_ns", axis=1, inplace=True)
         ret_label.drop("num_interior_pts", axis=1, inplace=True)
@@ -102,7 +105,8 @@ class ArgoverseDataset(Dataset):
 
         #x = np.swapaxes(np.dstack(agg_view),0,2)
         x = np.vstack(agg_view)
-        return torch.as_tensor(x), torch.as_tensor(ret_label.to_numpy()[:10])
+        #return torch.as_tensor(x), torch.as_tensor(ret_label.to_numpy()[:10])
+        return torch.as_tensor(x), torch.as_tensor(ret_label['category'].to_numpy()[:10])
     
 def get_dataLoader(data: ArgoverseDataset) -> DataLoader :
     return DataLoader(
@@ -112,17 +116,28 @@ def get_dataLoader(data: ArgoverseDataset) -> DataLoader :
         pin_memory=False,
     )
 
-argo_data = ArgoverseDataset()
-argo_loader = get_dataLoader(argo_data)
-
 def loss_func(pred_label, true_label):
     """This is the loss function for the model. The labels 
        contain a model class as well as bounding box locations."""
-    return pred_label - true_label
+    #print(f"pred_label: {pred_label}")
+    #print(f"true_label: {true_label}")
+    finds = 0
+    
+    pred_label = np.argmax(pred_label.detach().numpy(), axis=1)
+    for label in true_label:
+        if label in pred_label:
+            finds += 1
+
+    return 1 - finds/len(true_label)
+
+### BEGIN THE SCRIPT ###
+# instantiate the training data and the data loader
+argo_data = ArgoverseDataset()
+argo_loader = get_dataLoader(argo_data)
 
 # Create model 
 proj_model = timm.create_model(
-    "mobilenetv3_large_100",
+"mobilenetv3_large_100",
     pretrained=True,
     in_chans=IN_CHANNELS,
     num_classes=11,
@@ -133,6 +148,7 @@ print(proj_model.default_cfg)
 optimizer = torch.optim.AdamW(proj_model.parameters(), lr=0.01)
 # print(proj_model)
 
+### TRAIN ###
 for epoch in range(NUM_EPOCHS):
     print(f"Epoch number: {epoch}")
     for x, true_label in argo_loader:
@@ -143,13 +159,14 @@ for epoch in range(NUM_EPOCHS):
         #print(f"true_label: {true_label}")
         loss = loss_func(pred_label, true_label)
 
-        loss.mean.backward()
+        #loss.backward()
         optimizer.step()
         optimizer.zero_grad()
 
-# put model into eval mode
+### EVALUATE ###
 proj_model.eval()
 
+# instantiate the testing data and the data loader
 test_argo_data = ArgoverseDataset(
     f"{DATASET_PATH}/01bb304d-7bd8-35f8-bbef-7086b688e35e/sensors/", 
     f"{DATASET_PATH}/022af476-9937-3e70-be52-f65420d52703/annotations.feather",
@@ -158,5 +175,4 @@ test_argo_loader = get_dataLoader(test_argo_data)
 
 for x, true_label in test_argo_loader:
     print(x.shape)
-    break;
     confidences_logits, logits = proj_model(x)
