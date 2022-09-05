@@ -24,7 +24,7 @@ DATASET_PATH = "D:\dummy_data"
 IN_CHANNELS = 27
 TIME_LIMIT = 80
 BATCH_SIZE = 4
-NUM_EPOCHS = 2
+NUM_EPOCHS = 20
 
 LABELS_NUMS2WORDS_MAP = {
     1: "REGULAR_VEHICLE",
@@ -75,13 +75,13 @@ class ArgoverseDataset(Dataset):
     def __init__(
         self, 
         img_dir: str=f"{DATASET_PATH}/01bb304d-7bd8-35f8-bbef-7086b688e35e/sensors/", 
-        annotations_file: str=f"{DATASET_PATH}/01bb304d-7bd8-35f8-bbef-7086b688e35e/annotations.feather", 
+        annotations_file: str=f"{DATASET_PATH}/01bb304d-7bd8-35f8-bbef-7086b688e35e/annotations.feather",
     ):
         # read_feather returns a pandas dataframe
         self.img_labels = read_feather(annotations_file)
         self.img_dir = img_dir
+        self.drive_dir = self.img_dir.split("/")[1]
         self.argo_data = AV2SensorDataLoader(data_dir=Path(f"{DATASET_PATH}"), labels_dir=Path(f"{DATASET_PATH}"))
-        self.transform = transforms.Compose([transforms.ToTensor(), transforms.Resize((224, 224))])
 
     def __len__(self) -> int:
         return len(self.img_labels)
@@ -89,15 +89,15 @@ class ArgoverseDataset(Dataset):
     def __getitem__(self, idx: int) -> tuple:
         ## Data Ingestion 
         timestamp = self.img_labels.iloc[idx, 0]
-        rfc_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "ring_front_center", timestamp)
-        rfl_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "ring_front_left", timestamp)
-        rfr_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "ring_front_right", timestamp)
-        rrl_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "ring_rear_left", timestamp)
-        rrr_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "ring_rear_right", timestamp)
-        rsl_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "ring_side_left", timestamp)
-        rsr_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "ring_side_right", timestamp)
-        sfl_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "stereo_front_left", timestamp)
-        sfr_path = self.argo_data.get_closest_img_fpath("01bb304d-7bd8-35f8-bbef-7086b688e35e", "stereo_front_right", timestamp)
+        rfc_path = self.argo_data.get_closest_img_fpath(str(self.drive_dir), "ring_front_center", timestamp)
+        rfl_path = self.argo_data.get_closest_img_fpath(str(self.drive_dir), "ring_front_left", timestamp)
+        rfr_path = self.argo_data.get_closest_img_fpath(str(self.drive_dir), "ring_front_right", timestamp)
+        rrl_path = self.argo_data.get_closest_img_fpath(str(self.drive_dir), "ring_rear_left", timestamp)
+        rrr_path = self.argo_data.get_closest_img_fpath(str(self.drive_dir), "ring_rear_right", timestamp)
+        rsl_path = self.argo_data.get_closest_img_fpath(str(self.drive_dir), "ring_side_left", timestamp)
+        rsr_path = self.argo_data.get_closest_img_fpath(str(self.drive_dir), "ring_side_right", timestamp)
+        sfl_path = self.argo_data.get_closest_img_fpath(str(self.drive_dir), "stereo_front_left", timestamp)
+        sfr_path = self.argo_data.get_closest_img_fpath(str(self.drive_dir), "stereo_front_right", timestamp)
 
         ## Data Preprocessing
         img_list = [rfc_path, rfl_path, rfr_path, rrl_path, rrr_path, rsl_path, rsr_path, sfl_path, sfr_path]
@@ -123,17 +123,20 @@ def get_dataLoader(data: ArgoverseDataset) -> DataLoader :
 def proj_loss_func(pred_label, true_label):
     """This is the loss function for the model. The labels 
        contain a model class as well as bounding box locations."""
-    #print(f"pred_label: {pred_label}")
-    #print(f"true_label: {true_label}")
     finds = []
     
     pred_label = torch.argmax(pred_label, axis=1)
-    for label in true_label:
-        for pred in pred_label:
-            if label in pred:
+    for pair in list(zip(pred_label, true_label)):
+        pred = pair[0]
+        true_label_ = pair[1]
+        found = False
+        for label in true_label_:
+            if pred == label[0]:
+                found = True
                 finds.append(1)
-            else: 
-                finds.append(0)
+                break;
+        if not found: 
+            finds.append(0)
 
     return torch.sum(torch.as_tensor(finds)/len(true_label))
 
@@ -150,20 +153,20 @@ proj_model = timm.create_model(
     num_classes=10,
 )
 print(proj_model.default_cfg)
-#proj_model.cuda()
 
 optimizer = torch.optim.AdamW(proj_model.parameters(), lr=0.01)
-# print(proj_model)
 
 
 ### TRAIN ###
+# debug flag runs subset of training data to spend up debug process
+debug = True 
 for epoch in range(NUM_EPOCHS):
     print(f"Epoch number: {epoch}")
     counter = 0 
+    loss_list = []
     for x, true_label in argo_loader:
         optimizer.zero_grad()
         pred_label = proj_model(x)
-        # print(f"losses: {pred_label}")
         # loss_func = JaccardIndex(10, multilabel=True)
         loss = proj_loss_func(pred_label, true_label).requires_grad_()
 
@@ -172,29 +175,34 @@ for epoch in range(NUM_EPOCHS):
         counter += 1
         torch.cuda.empty_cache()
 
-        if counter == 50:
+        if debug and counter == 50:
             break;
         if counter % 5 == 0:
-            print(counter)
+            loss_list.append(loss)
+            print(f"At batch {counter} in epoch {epoch}, the loss is {loss}. The aggregate loss is {sum(loss_list)/len(loss_list)}")
 
 
 ### EVALUATE ###
 proj_model.eval()
 
 # instantiate the testing data and the data loader
-test_argo_data = ArgoverseDataset()
-#    f"{DATASET_PATH}/022af476-9937-3e70-be52-f65420d52703/sensors/", 
-#    f"{DATASET_PATH}/022af476-9937-3e70-be52-f65420d52703/annotations.feather",
-#)
+test_argo_data = ArgoverseDataset(
+    f"{DATASET_PATH}/022af476-9937-3e70-be52-f65420d52703/sensors/", 
+    f"{DATASET_PATH}/022af476-9937-3e70-be52-f65420d52703/annotations.feather",
+)
 test_argo_loader = get_dataLoader(test_argo_data)
 
 counter = 0
+losses = []
 for x, true_label in test_argo_loader:
-    confidences_logits = proj_model(x)
+    predictions = proj_model(x)
+    losses.append(proj_loss_func(predictions, true_label).tolist())
     counter += 1
-    if counter > 10:
+    torch.cuda.empty_cache()
+    if counter > 100:
         break;
 
+print(f"The aggregate loss of inference is {sum(losses)/len(losses)}")
 
 ### VISUALIZATION ###
 # Right now, the visualization just visualizes the image data. It does not add any info gleaned from 
@@ -250,9 +258,9 @@ for filename in os.listdir("D:/dummy_data/01bb304d-7bd8-35f8-bbef-7086b688e35e/s
         stereo_front_left_fpath,
         stereo_front_right_fpath,
     ]
-    x = data_processing(img_list)
-    boxes = proj_model(np.expand_dims(x, axis=0))
-    print(f"boxes: {boxes}")
+    #x = data_processing(img_list)
+    #boxes = proj_model(np.expand_dims(x, axis=0))
+    #print(f"boxes: {boxes}")
 
     # add images from all cameras to one frame
     frame = av.VideoFrame.from_ndarray(np.array(tile_cameras(named_sensor_data)), format="rgb24")
